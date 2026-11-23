@@ -114,6 +114,9 @@ def write_results(model: str, bench_dir: Path, qtypes: list[str], metrics: dict,
     to_write["partial"] = partial
     if out_path.exists():
         existing = json.loads(out_path.read_text(encoding="utf-8"))
+        for qt in QUERY_TYPES:  # keep stored query types this call didn't evaluate
+            if qt not in qtypes and isinstance(existing.get(qt), dict):
+                to_write[qt] = existing[qt]
         for qt in qtypes:
             if qt in to_write and qt in existing and isinstance(existing[qt], dict):
                 for sub, sub_d in existing[qt].items():
@@ -131,7 +134,7 @@ def write_results(model: str, bench_dir: Path, qtypes: list[str], metrics: dict,
             for sub, sub_d in to_write[qt].items()
             if isinstance(sub_d, dict)
         }
-        for qt in qtypes if qt in to_write
+        for qt in QUERY_TYPES if qt in to_write
     }
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     if not partial:
