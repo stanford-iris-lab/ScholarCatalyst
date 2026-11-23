@@ -359,7 +359,7 @@ def rerank_tournament(
             parsed_ok = True
             remaining = [d for d in batch if d["id"] not in seen]
             result = ranked + remaining
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, TypeError):
             result = batch
 
         if trace is not None:
