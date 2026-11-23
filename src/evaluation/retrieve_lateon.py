@@ -51,8 +51,14 @@ def temporal_filter(ranking: list[dict], query_date: str, corpus_dates: dict[str
     return filtered
 
 
-def load_queries(data_dir: Path, query_type: str) -> tuple[list[str], list[str], list[str]]:
-    qids, texts, dates = [], [], []
+def drop_paper(ranking: list[dict], paper_id) -> list[dict]:
+    """The ranking without the query's own paper (a bare id or every corpus id of it), as in retrieve.py."""
+    ids = ({paper_id} if isinstance(paper_id, str) else set(paper_id)) - {""}
+    return [item for item in ranking if item["doc_id"] not in ids] if ids else ranking
+
+
+def load_queries(data_dir: Path, query_type: str) -> tuple[list[str], list[str], list[str], list[str]]:
+    qids, texts, dates, papers = [], [], [], []
     for line in (data_dir / "queries.jsonl").read_text().splitlines():
         if not line.strip():
             continue
@@ -62,7 +68,8 @@ def load_queries(data_dir: Path, query_type: str) -> tuple[list[str], list[str],
         qids.append(d["id"])
         texts.append(d.get("question") or "")
         dates.append(d.get("paper_published", ""))
-    return qids, texts, dates
+        papers.append(d.get("paper_id", ""))
+    return qids, texts, dates, papers
 
 
 def load_corpus(bench_dir: Path) -> tuple[list[str], list[str], dict[str, str]]:
@@ -120,7 +127,8 @@ def stage_retrieve(args, bench_dir: Path) -> None:
     from pylate import indexes, retrieve
 
     data_dir = (bench_dir / args.set_name) if args.set_name else bench_dir
-    _, _, corpus_dates = load_corpus(bench_dir)
+    corpus_ids, _, corpus_dates = load_corpus(bench_dir)
+    max_k = len(corpus_ids)
     model = build_model(args)
     index = indexes.PLAID(index_folder=str(bench_dir / "embeddings" / args.tag),
                           index_name="plaid", override=False)
@@ -129,23 +137,35 @@ def stage_retrieve(args, bench_dir: Path) -> None:
     out_dir = data_dir / "runs" / "multi_vector" / args.tag
     out_dir.mkdir(parents=True, exist_ok=True)
     for qt in QUERY_TYPES:
-        qids, texts, qdates = load_queries(data_dir, qt)
+        qids, texts, qdates, qpapers = load_queries(data_dir, qt)
         q_embs = model.encode(texts, batch_size=args.batch_size, is_query=True,
                               show_progress_bar=True)
         # search in chunks: fast_plaid moves the whole query batch to the GPU
         # at once, and long queries (256 tokens) blow past GPU memory when all
         # queries of a set go in a single call
-        hits = []
-        for start in range(0, len(q_embs), args.search_chunk):
-            hits.extend(retriever.retrieve(
-                queries_embeddings=q_embs[start:start + args.search_chunk],
-                k=args.top_k))
-            print(f"  [{qt}] searched {min(start + args.search_chunk, len(q_embs))}/{len(q_embs)}")
-        results = []
-        for qid, qdate, docs in zip(qids, qdates, hits):
-            ranking = [{"doc_id": d["id"], "score": float(d["score"])} for d in docs]
-            ranking = temporal_filter(ranking, qdate, corpus_dates)
-            results.append({"query_id": qid, "ranking": ranking})
+        # Date filtering and dropping the query's own paper can leave fewer than top_k hits, so widen
+        # the search depth for short queries until each has top_k or the index is exhausted (as in retrieve.py).
+        final_rankings: list[list[dict] | None] = [None] * len(qids)
+        pending = list(range(len(qids)))
+        k = args.top_k
+        while pending:
+            hits = []
+            for start in range(0, len(pending), args.search_chunk):
+                hits.extend(retriever.retrieve(
+                    queries_embeddings=[q_embs[i] for i in pending[start:start + args.search_chunk]],
+                    k=k))
+                print(f"  [{qt}] searched {min(start + args.search_chunk, len(pending))}/{len(pending)} (k={k})")
+            still_pending = []
+            for i, docs in zip(pending, hits):
+                ranking = [{"doc_id": d["id"], "score": float(d["score"])} for d in docs]
+                filtered = drop_paper(temporal_filter(ranking, qdates[i], corpus_dates), qpapers[i])
+                if len(filtered) >= args.top_k or k >= max_k:
+                    final_rankings[i] = filtered[:args.top_k]
+                else:
+                    still_pending.append(i)
+            pending = still_pending
+            k = min(k * 4, max_k)
+        results = [{"query_id": qid, "ranking": final_rankings[i]} for i, qid in enumerate(qids)]
         run_file = out_dir / f"{qt}.jsonl"
         run_file.write_text("\n".join(json.dumps(r) for r in results))
         print(f"  [{qt}] {len(results)} queries -> {run_file}")
